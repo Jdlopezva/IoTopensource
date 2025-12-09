@@ -11,7 +11,7 @@ const char* MQTT_USER   = "esp32user";       // si habilitas auth en Mosquitto
 const char* MQTT_PASS   = "esp32pass";       // idem
 const char* BASE_TOPIC  = "home/lab/esp32s3"; // prefijo de tus topics
 
-// Topic para comandos de alarma (apagado, test, etc.)
+// Topic para comandos de alarma (apagado, enable/disable, etc.)
 const char* ALARM_CMD_TOPIC = "home/lab/esp32s3/alarm/cmd";
 
 // ====== PINES ======
@@ -38,7 +38,8 @@ int lastPir = -1;
 
 // Variables para conteo de MOTION y alarma
 int motionStreak = 0;
-bool alarmActive = false;
+bool alarmActive = false;      // ¿La alarma está sonando?
+bool alarmEnabled = true;      // ¿La lógica de alarma está armada?
 unsigned long alarmEndTime = 0;
 unsigned long lastBeepToggle = 0;
 
@@ -65,6 +66,18 @@ void connectWiFi() {
   }
   Serial.print("\nWiFi OK. IP: "); 
   Serial.println(WiFi.localIP());
+}
+
+void publishAlarmEnabledState() {
+  char topic[96];
+  snprintf(topic, sizeof(topic), "%s/alarm/enabled", BASE_TOPIC);
+  mqtt.publish(topic, alarmEnabled ? "true" : "false", true);
+}
+
+void publishAlarmActiveState() {
+  char topic[96];
+  snprintf(topic, sizeof(topic), "%s/alarm/state", BASE_TOPIC);
+  mqtt.publish(topic, alarmActive ? "ON" : "OFF", true);
 }
 
 void connectMQTT() {
@@ -112,6 +125,10 @@ void connectMQTT() {
         Serial.println("Error al suscribirse a ALARM_CMD_TOPIC");
       }
 
+      // Publicar estados iniciales
+      publishAlarmEnabledState();
+      publishAlarmActiveState();
+
     } else {
       Serial.print(" fail rc="); 
       Serial.println(mqtt.state());
@@ -137,27 +154,43 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (String(topic) == String(ALARM_CMD_TOPIC)) {
     msg.toUpperCase();
 
+    // Silenciar la alarma actual, pero sin deshabilitarla permanentemente
     if (msg == "OFF" || msg == "STOP" || msg == "SILENCE") {
-      // Apagar alarma y buzzer
       alarmActive = false;
       motionStreak = 0;
       digitalWrite(BUZZER_PIN, LOW);
-
-      Serial.println(">>> Comando recibido: APAGAR ALARMA / BUZZER OFF <<<");
-
-      // Opcional: publicar estado de la alarma
-      char stateTopic[96];
-      snprintf(stateTopic, sizeof(stateTopic), "%s/alarm/state", BASE_TOPIC);
-      mqtt.publish(stateTopic, "OFF", true);
+      Serial.println(">>> Comando: SILENCIAR ALARMA / BUZZER OFF <<<");
+      publishAlarmActiveState();
     }
 
-    // Aquí podrías agregar otros comandos como "TEST", "ON", etc.
+    // Deshabilitar completamente la lógica de alarma (no se dispara hasta ENABLE)
+    if (msg == "DISABLE" || msg == "DISARM") {
+      alarmEnabled = false;
+      alarmActive = false;
+      motionStreak = 0;
+      digitalWrite(BUZZER_PIN, LOW);
+      Serial.println(">>> Comando: ALARMA DESARMADA (DISABLE) <<<");
+      publishAlarmEnabledState();
+      publishAlarmActiveState();
+    }
+
+    // Volver a habilitar la lógica de alarma
+    if (msg == "ENABLE" || msg == "ARM") {
+      alarmEnabled = true;
+      motionStreak = 0;
+      Serial.println(">>> Comando: ALARMA ARMADA (ENABLE) <<<");
+      publishAlarmEnabledState();
+      // alarmActive se mantiene como esté (normalmente OFF)
+    }
+
+    // Aquí podrías agregar otros comandos como "TEST", etc.
   }
 }
 
 // Manejar la bocina (alarma) sin bloquear el loop
 void handleAlarm() {
-  if (!alarmActive) {
+  // Si la alarma no está activa o está deshabilitada, buzzer siempre OFF
+  if (!alarmActive || !alarmEnabled) {
     digitalWrite(BUZZER_PIN, LOW);
     return;
   }
@@ -170,6 +203,7 @@ void handleAlarm() {
     motionStreak = 0;
     digitalWrite(BUZZER_PIN, LOW);
     Serial.println("Alarma finalizada, buzzer OFF");
+    publishAlarmActiveState();
     return;
   }
 
@@ -206,26 +240,27 @@ void loop() {
   int pir = digitalRead(PIR_PIN);
 
   // === LÓGICA DE CONTEO DE MOTION SEGUIDOS ===
-  if (pir == HIGH) {
-    if (motionStreak < MOTION_STREAK_THRESHOLD) {
-      motionStreak++;
+  if (alarmEnabled) {
+    if (pir == HIGH) {
+      if (motionStreak < MOTION_STREAK_THRESHOLD) {
+        motionStreak++;
+      }
+    } else {
+      // Si el sensor se pone en CLEAR, reiniciamos el conteo
+      motionStreak = 0;
     }
   } else {
-    // Si el sensor se pone en CLEAR, reiniciamos el conteo
+    // Si la alarma está deshabilitada, no contamos
     motionStreak = 0;
   }
 
-  // Si aún no está activa la alarma y se alcanzó el umbral, la disparamos
-  if (!alarmActive && motionStreak >= MOTION_STREAK_THRESHOLD) {
+  // Si aún no está activa la alarma y se alcanzó el umbral, y además está habilitada
+  if (!alarmActive && alarmEnabled && motionStreak >= MOTION_STREAK_THRESHOLD) {
     alarmActive = true;
     alarmEndTime = millis() + ALARM_DURATION_MS;
     lastBeepToggle = millis();     // para iniciar el patrón de beep
     Serial.println(">>> UMBRAL DE MOTION ALCANZADO: ALARMA ACTIVADA <<<");
-
-    // Opcional: publicar estado de alarma ON
-    char stateTopic[96];
-    snprintf(stateTopic, sizeof(stateTopic), "%s/alarm/state", BASE_TOPIC);
-    mqtt.publish(stateTopic, "ON", true);
+    publishAlarmActiveState();
   }
 
   // Debug periódico de PIR
@@ -237,7 +272,11 @@ void loop() {
     Serial.print(" -> ");
     Serial.print(pir ? "MOTION" : "CLEAR");
     Serial.print(" | motionStreak = ");
-    Serial.println(motionStreak);
+    Serial.print(motionStreak);
+    Serial.print(" | alarmEnabled = ");
+    Serial.print(alarmEnabled ? "true" : "false");
+    Serial.print(" | alarmActive = ");
+    Serial.println(alarmActive ? "true" : "false");
   }
 
   // Publica cambio de estado del PIR
@@ -277,15 +316,16 @@ void loop() {
       mqtt.publish(topic, payload);
     }
 
-    // JSON agregado con t, h, pir, streak y estado de alarma
+    // JSON agregado con t, h, pir, streak y estados de alarma
     snprintf(topic, sizeof(topic), "%s/tele", BASE_TOPIC);
     snprintf(payload, sizeof(payload),
-      "{\"t\":%.2f,\"h\":%.2f,\"pir\":\"%s\",\"streak\":%d,\"alarm\":%s}",
+      "{\"t\":%.2f,\"h\":%.2f,\"pir\":\"%s\",\"streak\":%d,\"alarm\":%s,\"alarmEnabled\":%s}",
       ok ? t : -127.0f,
       ok ? h : -1.0f,
       pir ? "MOTION" : "CLEAR",
       motionStreak,
-      alarmActive ? "true" : "false"
+      alarmActive ? "true" : "false",
+      alarmEnabled ? "true" : "false"
     );
 
     mqtt.publish(topic, payload);
